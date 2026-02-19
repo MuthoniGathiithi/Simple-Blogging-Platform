@@ -1,0 +1,19 @@
+
+
+.body {
+  background-color: whitesmoke; /* dark background */
+}
+
+/* Ensure the page has no default body margin so header/footer span edge-to-edge */
+body {
+  margin: 0;
+}
+
+.App {
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh; /* optional: center vertically */
+}
+

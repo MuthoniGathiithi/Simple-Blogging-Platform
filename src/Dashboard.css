@@ -1,0 +1,21 @@
+.mobile-menu-button { display: none; }
+
+@media (max-width: 768px) {
+  .mobile-menu-button { display: block !important; }
+  .sidebar-mobile-hidden { transform: translateX(-100%) !important; }
+  .sidebar-mobile-visible { transform: translateX(0) !important; }
+  .main-mobile { margin-left: 0 !important; }
+  .top-bar-mobile { padding: 60px 16px 16px 16px !important; }
+  .page-title-mobile { font-size: 20px !important; }
+  .search-box-mobile { max-width: 100% !important; }
+  .content-mobile { padding: 16px !important; }
+  .form-grid-mobile { grid-template-columns: 1fr !important; }
+  .stats-row-mobile { grid-template-columns: 1fr !important; }
+  .lesson-grid-mobile { grid-template-columns: 1fr !important; }
+  .document-page-mobile { padding: 20px 16px !important; }
+  .action-bar-mobile { flex-direction: column !important; gap: 8px !important; }
+  .action-bar-right-mobile { width: 100% !important; flex-direction: column !important; gap: 8px !important; }
+  .doc-table-mobile { font-size: 10px !important; }
+  .table-label-cell-mobile { padding: 4px !important; }
+  .table-value-cell-mobile { padding: 4px !important; }
+}
