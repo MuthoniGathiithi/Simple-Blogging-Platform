@@ -227,7 +227,7 @@ export default function HomePage() {
                 letterSpacing: "-2px",
               }}
             >
-              AI-Powered Lesson Planner
+            identisacn ai 
             </h1>
           </div>
 
