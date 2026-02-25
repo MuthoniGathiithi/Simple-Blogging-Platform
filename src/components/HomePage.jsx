@@ -244,7 +244,7 @@ export default function HomePage() {
               marginRight: "auto",
             }}
           >
-            Let Identiscan  handle the registering while you focus on inspiring students.
+            Let Identiscan  handle the registering while you focus on inspiring students. identiscan 
           </p>
 
           <div
