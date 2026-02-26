@@ -395,8 +395,7 @@ export default function HomePage() {
                 className="about-description"
                 style={{ fontSize: "1.05rem", color: "#6B7280", lineHeight: "1.8", margin: "0 0 32px 0" }}
               >
-                Funzo Hub helps CBE teachers create structured, curriculum-aligned lesson plans in minutes, reducing
-                planning time and letting teachers focus on teaching.
+               identiscan aid in helping teachers plan faster and teach better by automating the registration process, allowing educators to focus more on teaching and less on administrative tasks. With identiscan, teachers can quickly register their classes and students, saving valuable time and reducing the hassle of paperwork. This streamlined process enables teachers to dedicate more energy to creating engaging lesson plans and providing personalized instruction, ultimately enhancing the learning experience for their students.  
               </p>
               <button
                 style={{
