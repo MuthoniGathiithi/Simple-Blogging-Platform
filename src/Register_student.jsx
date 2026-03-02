@@ -240,6 +240,7 @@ function CheckItem({ done, label, note }) {
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         fontSize: 11, color: done ? 'var(--accent)' : 'var(--muted)',
         transition: 'all 0.3s'
+        color
       }}>
         {done ? '✓' : '○'}
       </div>
