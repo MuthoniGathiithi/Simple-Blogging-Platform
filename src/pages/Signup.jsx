@@ -42,9 +42,15 @@ export default function Signup() {
           <label style={s.label}>Email</label>
           <input style={s.input} type="email" value={email} onChange={e => setEmail(e.target.value)} required />
           <label style={s.label}>Password</label>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
             <input style={{...s.input, flex: 1}} type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
-            <button type="button" onClick={() => setShowPassword(v => !v)} style={s.toggle}>{showPassword ? 'Hide' : 'Show'}</button>
+            <button type="button" onClick={() => setShowPassword(v => !v)} style={s.toggle} aria-label={showPassword ? 'Hide password' : 'Show password'} title={showPassword ? 'Hide password' : 'Show password'}>
+              {showPassword ? (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 3L21 21" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.58 10.58A3 3 0 0 0 13.42 13.42" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M2.88 12.1C4.7 7.98 8.6 5 12 5c2.26 0 4.3 1 6.06 2.62M21.12 11.9C19.3 16.02 15.4 19 12 19c-2.26 0-4.3-1-6.06-2.62" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              ) : (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="12" cy="12" r="3" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              )}
+            </button>
           </div>
           <button style={s.btn} type="submit" disabled={loading}>{loading ? 'Creating...' : 'Create Account'}</button>
         </form>

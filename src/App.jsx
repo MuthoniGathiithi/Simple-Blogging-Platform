@@ -5,6 +5,7 @@ import { supabase } from './supabase_client'
 import Landing from './landing'
 import Login from './pages/Login'
 import Signup from './pages/Signup'
+import UpdatePassword from './pages/UpdatePassword'
 import Dashboard from './Dashboard'
 import Layout from './components/Layout'
 import MarkAttendance from './pages/MarkAttendance'
@@ -55,6 +56,7 @@ export default function App() {
         <Route path="/" element={<Landing />} />
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<Signup />} />
+        <Route path="/update-password" element={<UpdatePassword />} />
 
         {/* Protected — dashboard as layout with nested pages */}
         <Route path="/dashboard" element={<PrivateRoute><Dashboard /></PrivateRoute>}>
