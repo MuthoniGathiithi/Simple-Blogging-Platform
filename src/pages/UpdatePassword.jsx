@@ -11,10 +11,12 @@ export default function UpdatePassword() {
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    // Parse tokens from URL
-    const params = new URLSearchParams(window.location.search)
-    const access_token = params.get('access_token') || params.get('access-token') || params.get('accessToken')
-    const refresh_token = params.get('refresh_token') || params.get('refresh-token') || params.get('refreshToken')
+    // Supabase sends tokens in the URL fragment (hash) like #access_token=...&refresh_token=...
+    const searchParams = new URLSearchParams(window.location.search)
+    const hash = window.location.hash ? window.location.hash.replace(/^#/, '') : ''
+    const hashParams = new URLSearchParams(hash)
+    const access_token = hashParams.get('access_token') || searchParams.get('access_token') || hashParams.get('access-token') || searchParams.get('access-token')
+    const refresh_token = hashParams.get('refresh_token') || searchParams.get('refresh_token') || hashParams.get('refresh-token') || searchParams.get('refresh-token')
 
     if (!access_token) {
       setMsg({ type: 'error', text: 'No reset token found in the URL. Please use the link from your email.' })
@@ -31,6 +33,8 @@ export default function UpdatePassword() {
           return
         }
         setReady(true)
+        // Clean the URL so tokens aren't visible in the address bar
+        history.replaceState(null, '', window.location.pathname)
       } catch (err) {
         setMsg({ type: 'error', text: (err && err.message) || 'Network error while restoring session.' })
         console.error('session restore', err)

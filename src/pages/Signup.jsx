@@ -42,9 +42,9 @@ export default function Signup() {
           <label style={s.label}>Email</label>
           <input style={s.input} type="email" value={email} onChange={e => setEmail(e.target.value)} required />
           <label style={s.label}>Password</label>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <input style={{...s.input, flex: 1}} type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
-            <button type="button" onClick={() => setShowPassword(v => !v)} style={s.toggle} aria-label={showPassword ? 'Hide password' : 'Show password'} title={showPassword ? 'Hide password' : 'Show password'}>
+          <div style={{ position: 'relative', display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input style={{...s.input, flex: 1, paddingRight: 44}} type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
+            <button type="button" onClick={() => setShowPassword(v => !v)} style={s.toggleAbsolute} aria-label={showPassword ? 'Hide password' : 'Show password'} title={showPassword ? 'Hide password' : 'Show password'}>
               {showPassword ? (
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 3L21 21" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M10.58 10.58A3 3 0 0 0 13.42 13.42" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><path d="M2.88 12.1C4.7 7.98 8.6 5 12 5c2.26 0 4.3 1 6.06 2.62M21.12 11.9C19.3 16.02 15.4 19 12 19c-2.26 0-4.3-1-6.06-2.62" stroke="#e8e8f2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
               ) : (
@@ -70,4 +70,5 @@ const s = {
   input: { padding: 10, borderRadius: 8, border: '1px solid #252535', background: '#0f0f16', color: '#e8e8f2' },
   btn: { marginTop: 6, padding: 10, borderRadius: 8, border: 'none', background: '#00e5a0', color: '#000', fontWeight: 700, cursor: 'pointer' }
   ,toggle: { padding: '8px 10px', borderRadius: 8, border: 'none', background: '#252535', color: '#e8e8f2', cursor: 'pointer' }
+  ,toggleAbsolute: { position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', padding: 6, border: 'none', background: 'transparent', color: '#e8e8f2', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }
 }
