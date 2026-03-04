@@ -9,17 +9,24 @@ export default function Signup() {
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [msg, setMsg] = useState(null)
+  const [showPassword, setShowPassword] = useState(false)
 
   const handleSignup = async (e) => {
     e.preventDefault()
     setLoading(true); setMsg(null)
-    const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { full_name: name } } })
-    setLoading(false)
-    if (error) return setMsg({ type: 'error', text: error.message })
-    if (data.user && !data.session) {
-      setMsg({ type: 'info', text: 'Check your email to confirm your account.' })
-    } else {
-      navigate('/dashboard')
+    try {
+      const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { full_name: name } } })
+      if (error) return setMsg({ type: 'error', text: error.message })
+      if (data.user && !data.session) {
+        setMsg({ type: 'info', text: 'Check your email to confirm your account.' })
+      } else {
+        navigate('/dashboard')
+      }
+    } catch (err) {
+      setMsg({ type: 'error', text: (err && err.message) || 'Network error. Check console.' })
+      console.error('Signup error', err)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -35,7 +42,10 @@ export default function Signup() {
           <label style={s.label}>Email</label>
           <input style={s.input} type="email" value={email} onChange={e => setEmail(e.target.value)} required />
           <label style={s.label}>Password</label>
-          <input style={s.input} type="password" value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input style={{...s.input, flex: 1}} type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} required minLength={8} />
+            <button type="button" onClick={() => setShowPassword(v => !v)} style={s.toggle}>{showPassword ? 'Hide' : 'Show'}</button>
+          </div>
           <button style={s.btn} type="submit" disabled={loading}>{loading ? 'Creating...' : 'Create Account'}</button>
         </form>
         <div style={{ marginTop: 12, fontSize: 13 }}>
@@ -53,4 +63,5 @@ const s = {
   label: { fontSize: 12, color: '#5a5a75' },
   input: { padding: 10, borderRadius: 8, border: '1px solid #252535', background: '#0f0f16', color: '#e8e8f2' },
   btn: { marginTop: 6, padding: 10, borderRadius: 8, border: 'none', background: '#00e5a0', color: '#000', fontWeight: 700, cursor: 'pointer' }
+  ,toggle: { padding: '8px 10px', borderRadius: 8, border: 'none', background: '#252535', color: '#e8e8f2', cursor: 'pointer' }
 }
