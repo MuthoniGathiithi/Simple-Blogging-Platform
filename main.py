@@ -1,6 +1,4 @@
-# ═══════════════════════════════════════════════════════════════
-# FaceAttend — FastAPI Backend
-# ═══════════════════════════════════════════════════════════════
+
 
 import os, json, numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
