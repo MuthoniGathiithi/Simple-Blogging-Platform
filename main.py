@@ -7,18 +7,22 @@ from PIL import Image, ImageStat
 import io, tempfile
 from contextlib import asynccontextmanager
 
+# ── Force DeepFace to use torch not tensorflow ────────────────────
+os.environ["DEEPFACE_HOME"]  = "/tmp/.deepface"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress TF logs if it loads
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Warming up FaceNet model...")
     try:
-        blank = Image.new("RGB", (160, 160), color=(200, 200, 200))
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        blank = Image.new("RGB", (160, 160), color=(128, 128, 128))
+        tmp   = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         blank.save(tmp.name)
         DeepFace.represent(
             img_path=tmp.name,
             model_name="Facenet",
-            detector_backend="skip",       # ← changed
+            detector_backend="skip",
             enforce_detection=False
         )
         os.unlink(tmp.name)
@@ -30,7 +34,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── CORS ─────────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,15 +51,13 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-
-# ── Supabase ─────────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
 )
 
 MODEL_NAME = "Facenet"
-DETECTOR   = "skip"        # ← changed: face-api.js already detected face on frontend
 THRESHOLD  = 0.40
 
 
@@ -77,12 +79,11 @@ def cosine_distance(a: list, b: list) -> float:
     return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-# ── ROUTES ───────────────────────────────────────────────────────
+# ── ROUTES ────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {"status": "FaceAttend API running"}
-
 
 @app.get("/ping")
 def ping():
@@ -101,33 +102,35 @@ async def register_student(
     try:
         file_bytes = await photo.read()
 
-        # ── 1. Brightness check ──────────────────────────────────
+        # ── Brightness check ─────────────────────────────────────
         brightness = check_brightness(file_bytes)
         if brightness < 40:
-            raise HTTPException(status_code=400, detail="Image too dark. Please move to a better lit area and retake.")
+            raise HTTPException(status_code=400, detail="Image too dark. Move to a better lit area and retake.")
         if brightness > 230:
             raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
 
         tmp_path = image_to_tempfile(file_bytes)
 
-        # ── 2. Extract embedding (skip detection — already done by face-api.js) ──
+        # ── Extract embedding ────────────────────────────────────
+        # skip detector — face already validated by face-api.js on frontend
+        # This saves ~200MB RAM vs using opencv detector
         try:
-            all_faces = DeepFace.represent(
+            result = DeepFace.represent(
                 img_path=tmp_path,
                 model_name=MODEL_NAME,
-                detector_backend="skip",   # ← changed
-                enforce_detection=False    # ← changed
+                detector_backend="skip",
+                enforce_detection=False
             )
         except Exception as e:
             os.unlink(tmp_path)
             raise HTTPException(status_code=400, detail=f"Could not process face: {str(e)}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
-        os.unlink(tmp_path)
+        embedding = result[0]["embedding"]
 
-        face_data = all_faces[0]
-        embedding = face_data["embedding"]
-
-        # ── 3. Save to Supabase ──────────────────────────────────
+        # ── Save to Supabase ─────────────────────────────────────
         res = supabase.table("students").insert({
             "course_id":      int(course_id),
             "name":           name,
@@ -176,11 +179,10 @@ async def match_attendance(
             file_bytes = await photo.read()
             tmp_path   = image_to_tempfile(file_bytes)
             try:
-                # For attendance photos use opencv — teacher uploads full class photos
                 faces = DeepFace.represent(
                     img_path=tmp_path,
                     model_name=MODEL_NAME,
-                    detector_backend="opencv",
+                    detector_backend="opencv",  # need detection for class photos
                     enforce_detection=False
                 )
                 for face in faces:
@@ -188,7 +190,8 @@ async def match_attendance(
             except Exception:
                 pass
             finally:
-                os.unlink(tmp_path)
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
         if not detected_embeddings:
             raise HTTPException(status_code=400, detail="No faces detected in uploaded photos")
