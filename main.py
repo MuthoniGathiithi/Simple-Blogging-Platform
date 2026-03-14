@@ -4,16 +4,22 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from PIL import Image, ImageStat
-import face_recognition
+import insightface
+from insightface.app import FaceAnalysis
+import cv2
 import io
 from contextlib import asynccontextmanager
 
+face_app = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("FaceAttend API ready.")
+    global face_app
+    print("Loading InsightFace model...")
+    face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
+    face_app.prepare(ctx_id=0, det_size=(320, 320))
+    print("Model ready.")
     yield
-
 
 app = FastAPI(lifespan=lifespan)
 
@@ -40,18 +46,23 @@ supabase = create_client(
     os.environ["SUPABASE_SERVICE_KEY"]
 )
 
-THRESHOLD = 0.50  # face_recognition uses distance — lower = more similar
+THRESHOLD = 0.50
 
 
-def load_image(file_bytes: bytes):
+def load_cv2_image(file_bytes: bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    return np.array(img)
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
 def check_brightness(file_bytes: bytes) -> float:
     img  = Image.open(io.BytesIO(file_bytes)).convert("L")
     stat = ImageStat.Stat(img)
     return stat.mean[0]
+
+
+def cosine_distance(a, b):
+    a, b = np.array(a), np.array(b)
+    return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
 # ── ROUTES ────────────────────────────────────────────────────────
@@ -84,16 +95,16 @@ async def register_student(
         if brightness > 230:
             raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
 
-        # ── Get face encoding ────────────────────────────────────
-        img = load_image(file_bytes)
-        encodings = face_recognition.face_encodings(img)
+        # ── Detect face and get embedding ─────────────────────────
+        img   = load_cv2_image(file_bytes)
+        faces = face_app.get(img)
 
-        if len(encodings) == 0:
+        if len(faces) == 0:
             raise HTTPException(status_code=400, detail="No face detected. Ensure your face is clearly visible.")
-        if len(encodings) > 1:
+        if len(faces) > 1:
             raise HTTPException(status_code=400, detail="Multiple faces detected. Only one person should be in frame.")
 
-        embedding = encodings[0].tolist()
+        embedding = faces[0].embedding.tolist()
 
         # ── Save to Supabase ─────────────────────────────────────
         res = supabase.table("students").insert({
@@ -136,40 +147,40 @@ async def match_attendance(
                     "id":         s["id"],
                     "name":       s["name"],
                     "student_id": s["student_id"],
-                    "embedding":  np.array(json.loads(s["face_embedding"]))
+                    "embedding":  json.loads(s["face_embedding"])
                 })
 
-        detected_encodings = []
+        detected_embeddings = []
         for photo in photos:
             file_bytes = await photo.read()
-            img        = load_image(file_bytes)
-            encodings  = face_recognition.face_encodings(img)
-            detected_encodings.extend(encodings)
+            img        = load_cv2_image(file_bytes)
+            faces      = face_app.get(img)
+            for face in faces:
+                detected_embeddings.append(face.embedding.tolist())
 
-        if not detected_encodings:
+        if not detected_embeddings:
             raise HTTPException(status_code=400, detail="No faces detected in uploaded photos")
 
         present_ids = set()
         matches     = []
 
-        for detected_enc in detected_encodings:
-            if not stored:
-                break
-            known     = [s["embedding"] for s in stored]
-            distances = face_recognition.face_distance(known, detected_enc)
-            best_idx  = int(np.argmin(distances))
-            best_dist = distances[best_idx]
-
-            if best_dist <= THRESHOLD:
-                student = stored[best_idx]
-                if student["id"] not in present_ids:
-                    present_ids.add(student["id"])
+        for detected_emb in detected_embeddings:
+            best_match    = None
+            best_distance = 1.0
+            for student in stored:
+                dist = cosine_distance(detected_emb, student["embedding"])
+                if dist < best_distance:
+                    best_distance = dist
+                    best_match    = student
+            if best_match and best_distance <= THRESHOLD:
+                if best_match["id"] not in present_ids:
+                    present_ids.add(best_match["id"])
                     matches.append({
-                        "student_db_id": student["id"],
-                        "name":          student["name"],
-                        "student_id":    student["student_id"],
-                        "confidence":    round(1 - best_dist, 3),
-                        "distance":      round(float(best_dist), 3)
+                        "student_db_id": best_match["id"],
+                        "name":          best_match["name"],
+                        "student_id":    best_match["student_id"],
+                        "confidence":    round(1 - best_distance, 3),
+                        "distance":      round(best_distance, 3)
                     })
 
         attendance_date = date or None
