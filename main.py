@@ -168,9 +168,14 @@ async def match_attendance(
             best_similarity = -1.0
             for student in stored:
                 sim = cosine_similarity(detected_emb, student["embedding"])
+                print(f"  Comparing with {student['name']}: similarity={sim:.4f}")
                 if sim > best_similarity:
                     best_similarity = sim
                     best_match      = student
+
+            print(f"Best match: {best_match['name'] if best_match else 'none'}, similarity={best_similarity:.4f}, threshold={1 - THRESHOLD:.4f}")
+
+            # Match if similarity >= (1 - THRESHOLD)
 
             # Match if similarity >= (1 - THRESHOLD)
             # THRESHOLD=0.40 means similarity must be >= 0.60
