@@ -4,7 +4,6 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from PIL import Image, ImageStat
-import insightface
 from insightface.app import FaceAnalysis
 import cv2
 import io
@@ -23,7 +22,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── CORS ──────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,13 +38,14 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# ── Supabase ──────────────────────────────────────────────────────
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
 )
 
-THRESHOLD = 0.50
+# InsightFace embeddings are L2-normalized — cosine similarity works well
+# 0.30 = stricter, 0.45 = more lenient. Start at 0.40
+THRESHOLD = 0.40
 
 
 def load_cv2_image(file_bytes: bytes):
@@ -60,12 +59,15 @@ def check_brightness(file_bytes: bytes) -> float:
     return stat.mean[0]
 
 
-def cosine_distance(a, b):
-    a, b = np.array(a), np.array(b)
-    return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+def cosine_similarity(a, b):
+    # InsightFace embeddings are already L2-normalized
+    # so dot product = cosine similarity directly
+    a = np.array(a, dtype=np.float32)
+    b = np.array(b, dtype=np.float32)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    return float(np.dot(a, b))  # 1.0 = identical, 0.0 = different
 
-
-# ── ROUTES ────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -88,14 +90,12 @@ async def register_student(
     try:
         file_bytes = await photo.read()
 
-        # ── Brightness check ─────────────────────────────────────
         brightness = check_brightness(file_bytes)
         if brightness < 40:
             raise HTTPException(status_code=400, detail="Image too dark. Move to a better lit area and retake.")
         if brightness > 230:
             raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
 
-        # ── Detect face and get embedding ─────────────────────────
         img   = load_cv2_image(file_bytes)
         faces = face_app.get(img)
 
@@ -106,7 +106,6 @@ async def register_student(
 
         embedding = faces[0].embedding.tolist()
 
-        # ── Save to Supabase ─────────────────────────────────────
         res = supabase.table("students").insert({
             "course_id":      int(course_id),
             "name":           name,
@@ -165,22 +164,25 @@ async def match_attendance(
         matches     = []
 
         for detected_emb in detected_embeddings:
-            best_match    = None
-            best_distance = 1.0
+            best_match      = None
+            best_similarity = -1.0
             for student in stored:
-                dist = cosine_distance(detected_emb, student["embedding"])
-                if dist < best_distance:
-                    best_distance = dist
-                    best_match    = student
-            if best_match and best_distance <= THRESHOLD:
+                sim = cosine_similarity(detected_emb, student["embedding"])
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_match      = student
+
+            # Match if similarity >= (1 - THRESHOLD)
+            # THRESHOLD=0.40 means similarity must be >= 0.60
+            if best_match and best_similarity >= (1 - THRESHOLD):
                 if best_match["id"] not in present_ids:
                     present_ids.add(best_match["id"])
                     matches.append({
                         "student_db_id": best_match["id"],
                         "name":          best_match["name"],
                         "student_id":    best_match["student_id"],
-                        "confidence":    round(1 - best_distance, 3),
-                        "distance":      round(best_distance, 3)
+                        "confidence":    round(best_similarity, 3),
+                        "distance":      round(1 - best_similarity, 3)
                     })
 
         attendance_date = date or None
