@@ -15,7 +15,7 @@ face_app = None
 async def lifespan(app: FastAPI):
     global face_app
     print("Loading InsightFace model...")
-    face_app = FaceAnalysis(name="buffalo_sc", providers=["CPUExecutionProvider"])
+    face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(320, 320))
     print("Model ready.")
     yield
@@ -43,9 +43,9 @@ supabase = create_client(
     os.environ["SUPABASE_SERVICE_KEY"]
 )
 
-# InsightFace embeddings are L2-normalized — cosine similarity works well
-# 0.30 = stricter, 0.45 = more lenient. Start at 0.40
-THRESHOLD = 0.40
+# buffalo_l produces high quality embeddings
+# similarity >= 0.35 is a reliable match
+THRESHOLD = 0.35
 
 
 def load_cv2_image(file_bytes: bytes):
@@ -60,13 +60,11 @@ def check_brightness(file_bytes: bytes) -> float:
 
 
 def cosine_similarity(a, b):
-    # InsightFace embeddings are already L2-normalized
-    # so dot product = cosine similarity directly
     a = np.array(a, dtype=np.float32)
     b = np.array(b, dtype=np.float32)
     a = a / np.linalg.norm(a)
     b = b / np.linalg.norm(b)
-    return float(np.dot(a, b))  # 1.0 = identical, 0.0 = different
+    return float(np.dot(a, b))
 
 
 @app.get("/")
@@ -80,7 +78,7 @@ def ping():
 
 @app.post("/register")
 async def register_student(
-    photo:      UploadFile = File(...),
+    photos:     list[UploadFile] = File(...),   # now accepts multiple pose photos
     course_id:  str = Form(...),
     name:       str = Form(...),
     student_id: str = Form(""),
@@ -88,34 +86,45 @@ async def register_student(
     consent:    str = Form("true")
 ):
     try:
-        file_bytes = await photo.read()
+        embeddings = []
 
-        brightness = check_brightness(file_bytes)
-        if brightness < 40:
-            raise HTTPException(status_code=400, detail="Image too dark. Move to a better lit area and retake.")
-        if brightness > 230:
-            raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
+        for photo in photos:
+            file_bytes = await photo.read()
 
-        img   = load_cv2_image(file_bytes)
-        faces = face_app.get(img)
+            # Brightness check on first photo only
+            if not embeddings:
+                brightness = check_brightness(file_bytes)
+                if brightness < 40:
+                    raise HTTPException(status_code=400, detail="Image too dark. Move to a better lit area.")
+                if brightness > 230:
+                    raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
 
-        if len(faces) == 0:
-            raise HTTPException(status_code=400, detail="No face detected. Ensure your face is clearly visible.")
-        if len(faces) > 1:
-            raise HTTPException(status_code=400, detail="Multiple faces detected. Only one person should be in frame.")
+            img   = load_cv2_image(file_bytes)
+            faces = face_app.get(img)
 
-        embedding = faces[0].embedding.tolist()
+            if len(faces) == 0:
+                continue  # skip pose if no face detected — don't fail
+
+            # Take the most confident face
+            face = max(faces, key=lambda f: f.det_score)
+            embeddings.append(face.embedding.tolist())
+
+        if not embeddings:
+            raise HTTPException(status_code=400, detail="No face detected in any photo. Please ensure your face is clearly visible.")
+
+        # Average all pose embeddings → more robust representation
+        avg_embedding = np.mean(embeddings, axis=0).tolist()
 
         res = supabase.table("students").insert({
             "course_id":      int(course_id),
             "name":           name,
             "student_id":     student_id or None,
             "email":          email or None,
-            "face_embedding": json.dumps(embedding),
+            "face_embedding": json.dumps(avg_embedding),
             "consent":        consent.lower() == "true"
         }).execute()
 
-        return {"success": True, "student": res.data[0]}
+        return {"success": True, "student": res.data[0], "poses_used": len(embeddings)}
 
     except HTTPException:
         raise
@@ -168,18 +177,13 @@ async def match_attendance(
             best_similarity = -1.0
             for student in stored:
                 sim = cosine_similarity(detected_emb, student["embedding"])
-                print(f"  Comparing with {student['name']}: similarity={sim:.4f}")
                 if sim > best_similarity:
                     best_similarity = sim
                     best_match      = student
 
-            print(f"Best match: {best_match['name'] if best_match else 'none'}, similarity={best_similarity:.4f}, threshold={1 - THRESHOLD:.4f}")
+            print(f"Best: {best_match['name'] if best_match else 'none'} sim={best_similarity:.4f} threshold={THRESHOLD}")
 
-            # Match if similarity >= (1 - THRESHOLD)
-
-            # Match if similarity >= (1 - THRESHOLD)
-            # THRESHOLD=0.40 means similarity must be >= 0.60
-            if best_match and best_similarity >= (1 - THRESHOLD):
+            if best_match and best_similarity >= THRESHOLD:
                 if best_match["id"] not in present_ids:
                     present_ids.add(best_match["id"])
                     matches.append({
