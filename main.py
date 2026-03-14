@@ -1,34 +1,17 @@
-import os, json, numpy as np
+import os, json
+import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from deepface import DeepFace
 from supabase import create_client
 from PIL import Image, ImageStat
-import io, tempfile
+import face_recognition
+import io
 from contextlib import asynccontextmanager
-
-# ── Force DeepFace to use torch not tensorflow ────────────────────
-os.environ["DEEPFACE_HOME"]  = "/tmp/.deepface"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress TF logs if it loads
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Warming up FaceNet model...")
-    try:
-        blank = Image.new("RGB", (160, 160), color=(128, 128, 128))
-        tmp   = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        blank.save(tmp.name)
-        DeepFace.represent(
-            img_path=tmp.name,
-            model_name="Facenet",
-            detector_backend="skip",
-            enforce_detection=False
-        )
-        os.unlink(tmp.name)
-        print("Model ready.")
-    except Exception as e:
-        print(f"Warmup note: {e}")
+    print("FaceAttend API ready.")
     yield
 
 
@@ -57,26 +40,18 @@ supabase = create_client(
     os.environ["SUPABASE_SERVICE_KEY"]
 )
 
-MODEL_NAME = "Facenet"
-THRESHOLD  = 0.40
+THRESHOLD = 0.50  # face_recognition uses distance — lower = more similar
 
 
-def image_to_tempfile(file_bytes: bytes) -> str:
+def load_image(file_bytes: bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    img.save(tmp.name, "JPEG")
-    return tmp.name
+    return np.array(img)
 
 
 def check_brightness(file_bytes: bytes) -> float:
     img  = Image.open(io.BytesIO(file_bytes)).convert("L")
     stat = ImageStat.Stat(img)
     return stat.mean[0]
-
-
-def cosine_distance(a: list, b: list) -> float:
-    a, b = np.array(a), np.array(b)
-    return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
 # ── ROUTES ────────────────────────────────────────────────────────
@@ -109,26 +84,16 @@ async def register_student(
         if brightness > 230:
             raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
 
-        tmp_path = image_to_tempfile(file_bytes)
+        # ── Get face encoding ────────────────────────────────────
+        img = load_image(file_bytes)
+        encodings = face_recognition.face_encodings(img)
 
-        # ── Extract embedding ────────────────────────────────────
-        # skip detector — face already validated by face-api.js on frontend
-        # This saves ~200MB RAM vs using opencv detector
-        try:
-            result = DeepFace.represent(
-                img_path=tmp_path,
-                model_name=MODEL_NAME,
-                detector_backend="skip",
-                enforce_detection=False
-            )
-        except Exception as e:
-            os.unlink(tmp_path)
-            raise HTTPException(status_code=400, detail=f"Could not process face: {str(e)}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+        if len(encodings) == 0:
+            raise HTTPException(status_code=400, detail="No face detected. Ensure your face is clearly visible.")
+        if len(encodings) > 1:
+            raise HTTPException(status_code=400, detail="Multiple faces detected. Only one person should be in frame.")
 
-        embedding = result[0]["embedding"]
+        embedding = encodings[0].tolist()
 
         # ── Save to Supabase ─────────────────────────────────────
         res = supabase.table("students").insert({
@@ -171,51 +136,40 @@ async def match_attendance(
                     "id":         s["id"],
                     "name":       s["name"],
                     "student_id": s["student_id"],
-                    "embedding":  json.loads(s["face_embedding"])
+                    "embedding":  np.array(json.loads(s["face_embedding"]))
                 })
 
-        detected_embeddings = []
+        detected_encodings = []
         for photo in photos:
             file_bytes = await photo.read()
-            tmp_path   = image_to_tempfile(file_bytes)
-            try:
-                faces = DeepFace.represent(
-                    img_path=tmp_path,
-                    model_name=MODEL_NAME,
-                    detector_backend="opencv",  # need detection for class photos
-                    enforce_detection=False
-                )
-                for face in faces:
-                    detected_embeddings.append(face["embedding"])
-            except Exception:
-                pass
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+            img        = load_image(file_bytes)
+            encodings  = face_recognition.face_encodings(img)
+            detected_encodings.extend(encodings)
 
-        if not detected_embeddings:
+        if not detected_encodings:
             raise HTTPException(status_code=400, detail="No faces detected in uploaded photos")
 
         present_ids = set()
         matches     = []
 
-        for detected_emb in detected_embeddings:
-            best_match    = None
-            best_distance = 1.0
-            for student in stored:
-                dist = cosine_distance(detected_emb, student["embedding"])
-                if dist < best_distance:
-                    best_distance = dist
-                    best_match    = student
-            if best_match and best_distance <= THRESHOLD:
-                if best_match["id"] not in present_ids:
-                    present_ids.add(best_match["id"])
+        for detected_enc in detected_encodings:
+            if not stored:
+                break
+            known     = [s["embedding"] for s in stored]
+            distances = face_recognition.face_distance(known, detected_enc)
+            best_idx  = int(np.argmin(distances))
+            best_dist = distances[best_idx]
+
+            if best_dist <= THRESHOLD:
+                student = stored[best_idx]
+                if student["id"] not in present_ids:
+                    present_ids.add(student["id"])
                     matches.append({
-                        "student_db_id": best_match["id"],
-                        "name":          best_match["name"],
-                        "student_id":    best_match["student_id"],
-                        "confidence":    round(1 - best_distance, 3),
-                        "distance":      round(best_distance, 3)
+                        "student_db_id": student["id"],
+                        "name":          student["name"],
+                        "student_id":    student["student_id"],
+                        "confidence":    round(1 - best_dist, 3),
+                        "distance":      round(float(best_dist), 3)
                     })
 
         attendance_date = date or None

@@ -2,11 +2,7 @@
 fastapi==0.111.0
 uvicorn==0.29.0
 python-multipart==0.0.9
-deepface==0.0.93
-supabase==2.5.0
 numpy==1.26.4
 Pillow==10.2.0
-opencv-python-headless==4.9.0.80
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
---extra-index-url https://download.pytorch.org/whl/cpu
+supabase==2.5.0
+face_recognition==1.3.0
