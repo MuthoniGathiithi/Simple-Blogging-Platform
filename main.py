@@ -4,15 +4,19 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from PIL import Image, ImageStat
-import httpx, io
+from insightface.app import FaceAnalysis
+import cv2, io
 from contextlib import asynccontextmanager
 
-# ── One new env var to add to your existing Render service ────────
-FACE_SERVICE_URL = os.environ.get("FACE_SERVICE_URL", "")
+face_app = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Main API ready.")
+    global face_app
+    print("Loading buffalo_l model...")
+    face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    face_app.prepare(ctx_id=0, det_size=(320, 320))
+    print("Model ready.")
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -20,24 +24,35 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
-async def cors_headers(request: Request, call_next):
+async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-# Uses your existing SUPABASE_URL + SUPABASE_SERVICE_KEY — untouched
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
 )
+
+THRESHOLD = 0.35
+
+def load_cv2_image(file_bytes: bytes):
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 def check_brightness(file_bytes: bytes) -> float:
     img  = Image.open(io.BytesIO(file_bytes)).convert("L")
     stat = ImageStat.Stat(img)
     return stat.mean[0]
 
+def cosine_similarity(a, b):
+    a = np.array(a, dtype=np.float32)
+    b = np.array(b, dtype=np.float32)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
+    return float(np.dot(a, b))
 
 @app.get("/")
 def root():
@@ -46,7 +61,6 @@ def root():
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
 
 @app.post("/register")
 async def register_student(
@@ -58,39 +72,37 @@ async def register_student(
     consent:    str = Form("true")
 ):
     try:
-        # Read all photo bytes
-        all_bytes = []
-        for i, photo in enumerate(photos):
-            b = await photo.read()
-            # Brightness check on first photo only
-            if i == 0:
-                brightness = check_brightness(b)
+        embeddings = []
+        for photo in photos:
+            file_bytes = await photo.read()
+            if not embeddings:
+                brightness = check_brightness(file_bytes)
                 if brightness < 40:
                     raise HTTPException(status_code=400, detail="Image too dark. Move to a better lit area.")
                 if brightness > 230:
                     raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
-            all_bytes.append(b)
+            img   = load_cv2_image(file_bytes)
+            faces = face_app.get(img)
+            if len(faces) == 0:
+                continue
+            face = max(faces, key=lambda f: f.det_score)
+            embeddings.append(face.embedding.tolist())
 
-        # ── Call face service to get averaged embedding ───────────
-        async with httpx.AsyncClient(timeout=60) as client:
-            files = [("photos", (f"pose_{i}.jpg", b, "image/jpeg")) for i, b in enumerate(all_bytes)]
-            resp  = await client.post(f"{FACE_SERVICE_URL}/embed", files=files)
-            if resp.status_code != 200:
-                detail = resp.json().get("detail", "Face service error")
-                raise HTTPException(status_code=400, detail=detail)
-            embedding = resp.json()["embedding"]
+        if not embeddings:
+            raise HTTPException(status_code=400, detail="No face detected in any photo. Please ensure your face is clearly visible.")
 
-        # ── Save to Supabase ──────────────────────────────────────
+        avg_embedding = np.mean(embeddings, axis=0).tolist()
+
         res = supabase.table("students").insert({
             "course_id":      int(course_id),
             "name":           name,
             "student_id":     student_id or None,
             "email":          email or None,
-            "face_embedding": json.dumps(embedding),
+            "face_embedding": json.dumps(avg_embedding),
             "consent":        consent.lower() == "true"
         }).execute()
 
-        return {"success": True, "student": res.data[0]}
+        return {"success": True, "student": res.data[0], "poses_used": len(embeddings)}
 
     except HTTPException:
         raise
@@ -105,7 +117,6 @@ async def match_attendance(
     date:      str = Form("")
 ):
     try:
-        # Load stored embeddings from Supabase
         result = supabase.table("students") \
             .select("id, name, student_id, face_embedding") \
             .eq("course_id", int(course_id)) \
@@ -125,34 +136,41 @@ async def match_attendance(
                     "embedding":  json.loads(s["face_embedding"])
                 })
 
-        # Read all photo bytes
-        all_bytes = [await photo.read() for photo in photos]
+        detected_embeddings = []
+        for photo in photos:
+            file_bytes = await photo.read()
+            img        = load_cv2_image(file_bytes)
+            faces      = face_app.get(img)
+            for face in faces:
+                detected_embeddings.append(face.embedding.tolist())
 
-        # ── Call face service to compare faces ────────────────────
-        async with httpx.AsyncClient(timeout=120) as client:
-            files = [("photos", (f"photo_{i}.jpg", b, "image/jpeg")) for i, b in enumerate(all_bytes)]
-            resp  = await client.post(
-                f"{FACE_SERVICE_URL}/compare",
-                files=files,
-                data={"stored_embeddings": json.dumps(stored)}
-            )
-            if resp.status_code != 200:
-                detail = resp.json().get("detail", "Face service error")
-                raise HTTPException(status_code=400, detail=detail)
-            face_matches = resp.json()["matches"]  # [{id, similarity}]
+        if not detected_embeddings:
+            raise HTTPException(status_code=400, detail="No faces detected in uploaded photos")
 
-        # ── Build attendance records ──────────────────────────────
-        present_ids = {m["id"] for m in face_matches}
+        present_ids = set()
         matches     = []
-        for m in face_matches:
-            student = next((s for s in stored if s["id"] == m["id"]), None)
-            if student:
-                matches.append({
-                    "student_db_id": student["id"],
-                    "name":          student["name"],
-                    "student_id":    student["student_id"],
-                    "confidence":    m["similarity"],
-                })
+
+        for detected_emb in detected_embeddings:
+            best_match      = None
+            best_similarity = -1.0
+            for student in stored:
+                sim = cosine_similarity(detected_emb, student["embedding"])
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_match      = student
+
+            print(f"Best: {best_match['name'] if best_match else 'none'} sim={best_similarity:.4f}")
+
+            if best_match and best_similarity >= THRESHOLD:
+                if best_match["id"] not in present_ids:
+                    present_ids.add(best_match["id"])
+                    matches.append({
+                        "student_db_id": best_match["id"],
+                        "name":          best_match["name"],
+                        "student_id":    best_match["student_id"],
+                        "confidence":    round(best_similarity, 3),
+                        "distance":      round(1 - best_similarity, 3)
+                    })
 
         attendance_date = date or None
         records = []
