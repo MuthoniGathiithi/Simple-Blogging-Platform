@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 face_app = None
 
+# ── APP LIFESPAN ────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global face_app
@@ -22,7 +23,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
@@ -32,6 +39,7 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
+# ── SUPABASE ────────────────────────────────────────────────────
 supabase = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_SERVICE_KEY"]
@@ -39,8 +47,7 @@ supabase = create_client(
 
 THRESHOLD = 0.35
 
-# ── Helpers ──────────────────────────────────────────────────────
-
+# ── HELPERS ─────────────────────────────────────────────────────
 def load_cv2_image(file_bytes: bytes):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -71,33 +78,70 @@ def get_client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host
 
+# ── SAFE TIME PARSER (FIXED) ────────────────────────────────────
+def parse_utc_time(value: str) -> datetime:
+    """
+    Safely parse Supabase timestamptz into UTC-aware datetime.
+    Handles both 'Z' suffix and offset formats, and naive datetimes.
+    """
+    if value.endswith("Z"):
+        value = value.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(value)
+
+    # Ensure timezone-aware
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt
+
+# ── TOKEN VALIDATION ────────────────────────────────────────────
 def validate_token_full(token_str: str, client_ip: str, student_lat, student_lng) -> dict:
     """Full validation at submit time — checks expiry + IP + geo."""
     res = supabase.table("attendance_tokens") \
         .select("*").eq("token", token_str).eq("is_active", True).execute()
+
     if not res.data:
         raise HTTPException(status_code=403, detail="Invalid or inactive attendance link.")
+
     token = res.data[0]
 
-    expires_at = datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00"))
+    # FIXED EXPIRY CHECK
+    expires_at = parse_utc_time(token["expires_at"])
     if datetime.now(timezone.utc) > expires_at:
-        raise HTTPException(status_code=403, detail="This attendance link has expired. Ask your lecturer to generate a new one.")
+        raise HTTPException(
+            status_code=403,
+            detail="This attendance link has expired. Ask your lecturer to generate a new one."
+        )
 
+    # IP CHECK
     if token.get("allowed_ip"):
         if client_ip != token["allowed_ip"]:
-            raise HTTPException(status_code=403, detail=f"You must be on the school WiFi to mark attendance. (Your IP: {client_ip})")
+            raise HTTPException(
+                status_code=403,
+                detail=f"You must be on the school WiFi to mark attendance. (Your IP: {client_ip})"
+            )
 
+    # GEO CHECK
     if token.get("school_lat") and token.get("school_lng"):
         if student_lat is None or student_lng is None:
-            raise HTTPException(status_code=403, detail="Location access is required. Please allow location in your browser.")
-        distance = haversine_metres(token["school_lat"], token["school_lng"], student_lat, student_lng)
-        radius   = token.get("geo_radius_m", 500)
+            raise HTTPException(
+                status_code=403,
+                detail="Location access is required. Please allow location in your browser."
+            )
+        distance = haversine_metres(
+            token["school_lat"], token["school_lng"],
+            student_lat, student_lng
+        )
+        radius = token.get("geo_radius_m", 500)
         if distance > radius:
-            raise HTTPException(status_code=403, detail=f"You appear to be {int(distance)}m away. You must be on school premises.")
+            raise HTTPException(
+                status_code=403,
+                detail=f"You appear to be {int(distance)}m away. You must be on school premises."
+            )
 
     return token
 
-# ── Routes ───────────────────────────────────────────────────────
+# ── ROUTES ───────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -108,7 +152,7 @@ def ping():
     return {"ok": True}
 
 # ── VALIDATE TOKEN (GET — expiry check ONLY, no IP/geo) ──────────
-# This is called when student first opens the link to show course name.
+# Called when student first opens the link to show course name.
 # IP and geo are only enforced at POST /attend when they actually submit.
 @app.get("/token/{token_str}")
 async def check_token(token_str: str):
@@ -120,10 +164,13 @@ async def check_token(token_str: str):
 
     token = res.data[0]
 
-    # Only check expiry here — NOT IP or geo
-    expires_at = datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00"))
+    # FIXED EXPIRY CHECK — uses parse_utc_time
+    expires_at = parse_utc_time(token["expires_at"])
     if datetime.now(timezone.utc) > expires_at:
-        raise HTTPException(status_code=403, detail="This attendance link has expired. Ask your lecturer to generate a new one.")
+        raise HTTPException(
+            status_code=403,
+            detail="This attendance link has expired. Ask your lecturer to generate a new one."
+        )
 
     course = supabase.table("courses").select("title, code") \
         .eq("id", token["course_id"]).single().execute()
@@ -148,7 +195,10 @@ async def register_student(
     try:
         name_parts = name.strip().split()
         if len(name_parts) < 3:
-            raise HTTPException(status_code=400, detail="Please enter your full name with at least 3 names (first, middle, last).")
+            raise HTTPException(
+                status_code=400,
+                detail="Please enter your full name with at least 3 names (first, middle, last)."
+            )
 
         admission_number = admission_number.strip()
         if not admission_number:
@@ -158,7 +208,10 @@ async def register_student(
             .select("id").eq("course_id", int(course_id)) \
             .eq("admission_number", admission_number).execute()
         if existing.data:
-            raise HTTPException(status_code=400, detail="This admission number is already registered for this course.")
+            raise HTTPException(
+                status_code=400,
+                detail="This admission number is already registered for this course."
+            )
 
         embeddings = []
         for photo in photos:
@@ -177,7 +230,10 @@ async def register_student(
             embeddings.append(face.embedding.tolist())
 
         if not embeddings:
-            raise HTTPException(status_code=400, detail="No face detected in any photo. Please ensure your face is clearly visible.")
+            raise HTTPException(
+                status_code=400,
+                detail="No face detected in any photo. Please ensure your face is clearly visible."
+            )
 
         avg_embedding = np.mean(embeddings, axis=0).tolist()
 
@@ -196,7 +252,10 @@ async def register_student(
         raise
     except Exception as e:
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-            raise HTTPException(status_code=400, detail="This admission number is already registered for this course.")
+            raise HTTPException(
+                status_code=400,
+                detail="This admission number is already registered for this course."
+            )
         raise HTTPException(status_code=400, detail=str(e))
 
 # ── MARK ATTENDANCE — full validation here ────────────────────────
@@ -244,7 +303,10 @@ async def mark_attendance(
                 detected_embeddings.append(face.embedding.tolist())
 
         if not detected_embeddings:
-            raise HTTPException(status_code=400, detail="No face detected. Please try again in better lighting.")
+            raise HTTPException(
+                status_code=400,
+                detail="No face detected. Please try again in better lighting."
+            )
 
         avg_detected = np.mean(detected_embeddings, axis=0).tolist()
 
@@ -257,7 +319,10 @@ async def mark_attendance(
                 best_match      = student
 
         if not best_match or best_similarity < THRESHOLD:
-            raise HTTPException(status_code=400, detail="Face not recognised. Make sure you are registered for this course and try again in good lighting.")
+            raise HTTPException(
+                status_code=400,
+                detail="Face not recognised. Make sure you are registered for this course and try again in good lighting."
+            )
 
         today = datetime.now(timezone.utc).date().isoformat()
         already = supabase.table("attendance") \
@@ -320,9 +385,10 @@ async def match_attendance(
         for s in students:
             if s["face_embedding"]:
                 stored.append({
-                    "id": s["id"], "name": s["name"],
+                    "id":               s["id"],
+                    "name":             s["name"],
                     "admission_number": s["admission_number"],
-                    "embedding": json.loads(s["face_embedding"])
+                    "embedding":        json.loads(s["face_embedding"])
                 })
 
         detected_embeddings = []
@@ -380,11 +446,11 @@ async def match_attendance(
             supabase.table("attendance").upsert(records, on_conflict="course_id,student_id,date").execute()
 
         return {
-            "success": True,
+            "success":       True,
             "total_students": len(stored),
-            "present": len(matches),
-            "absent":  len(absent_ids),
-            "matches": matches
+            "present":       len(matches),
+            "absent":        len(absent_ids),
+            "matches":       matches
         }
 
     except HTTPException:
