@@ -1,6 +1,6 @@
 import os, json, math
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from PIL import Image, ImageStat
@@ -58,7 +58,6 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b))
 
 def haversine_metres(lat1, lng1, lat2, lng2) -> float:
-    """Distance in metres between two GPS coordinates."""
     R = 6_371_000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi       = math.radians(lat2 - lat1)
@@ -67,56 +66,34 @@ def haversine_metres(lat1, lng1, lat2, lng2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def get_client_ip(request: Request) -> str:
-    """Get the real public IP, checking proxy headers first."""
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host
 
-def validate_token(token_str: str, client_ip: str, student_lat: float | None, student_lng: float | None) -> dict:
-    """
-    Fetch token from DB and validate:
-      - exists and is active
-      - not expired
-      - IP matches (if set by teacher)
-      - student is within geo radius (if coordinates saved)
-    Returns the token row on success, raises HTTPException on failure.
-    """
+def validate_token_full(token_str: str, client_ip: str, student_lat, student_lng) -> dict:
+    """Full validation at submit time — checks expiry + IP + geo."""
     res = supabase.table("attendance_tokens") \
-        .select("*") \
-        .eq("token", token_str) \
-        .eq("is_active", True) \
-        .execute()
-
+        .select("*").eq("token", token_str).eq("is_active", True).execute()
     if not res.data:
         raise HTTPException(status_code=403, detail="Invalid or inactive attendance link.")
-
     token = res.data[0]
 
-    # Check expiry
     expires_at = datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00"))
     if datetime.now(timezone.utc) > expires_at:
         raise HTTPException(status_code=403, detail="This attendance link has expired. Ask your lecturer to generate a new one.")
 
-    # Check IP if teacher set one
     if token.get("allowed_ip"):
         if client_ip != token["allowed_ip"]:
-            raise HTTPException(
-                status_code=403,
-                detail=f"You must be on the school WiFi network to mark attendance. (Your IP: {client_ip})"
-            )
+            raise HTTPException(status_code=403, detail=f"You must be on the school WiFi to mark attendance. (Your IP: {client_ip})")
 
-    # Check geolocation if teacher saved coordinates
     if token.get("school_lat") and token.get("school_lng"):
         if student_lat is None or student_lng is None:
-            raise HTTPException(status_code=403, detail="Location access is required to mark attendance. Please allow location in your browser.")
+            raise HTTPException(status_code=403, detail="Location access is required. Please allow location in your browser.")
         distance = haversine_metres(token["school_lat"], token["school_lng"], student_lat, student_lng)
         radius   = token.get("geo_radius_m", 500)
         if distance > radius:
-            raise HTTPException(
-                status_code=403,
-                detail=f"You appear to be {int(distance)}m away from the classroom. You must be on school premises to mark attendance."
-            )
+            raise HTTPException(status_code=403, detail=f"You appear to be {int(distance)}m away. You must be on school premises.")
 
     return token
 
@@ -130,38 +107,59 @@ def root():
 def ping():
     return {"ok": True}
 
+# ── VALIDATE TOKEN (GET — expiry check ONLY, no IP/geo) ──────────
+# This is called when student first opens the link to show course name.
+# IP and geo are only enforced at POST /attend when they actually submit.
+@app.get("/token/{token_str}")
+async def check_token(token_str: str):
+    res = supabase.table("attendance_tokens") \
+        .select("*").eq("token", token_str).eq("is_active", True).execute()
+
+    if not res.data:
+        raise HTTPException(status_code=403, detail="Invalid or inactive attendance link.")
+
+    token = res.data[0]
+
+    # Only check expiry here — NOT IP or geo
+    expires_at = datetime.fromisoformat(token["expires_at"].replace("Z", "+00:00"))
+    if datetime.now(timezone.utc) > expires_at:
+        raise HTTPException(status_code=403, detail="This attendance link has expired. Ask your lecturer to generate a new one.")
+
+    course = supabase.table("courses").select("title, code") \
+        .eq("id", token["course_id"]).single().execute()
+
+    return {
+        "valid":      True,
+        "course_id":  token["course_id"],
+        "course":     course.data,
+        "expires_at": token["expires_at"]
+    }
 
 # ── REGISTER ─────────────────────────────────────────────────────
 @app.post("/register")
 async def register_student(
     photos:           list[UploadFile] = File(...),
-    course_id:        str  = Form(...),
-    name:             str  = Form(...),
-    admission_number: str  = Form(...),
-    email:            str  = Form(""),
-    consent:          str  = Form("true")
+    course_id:        str = Form(...),
+    name:             str = Form(...),
+    admission_number: str = Form(...),
+    email:            str = Form(""),
+    consent:          str = Form("true")
 ):
     try:
-        # Validate 3-word name
         name_parts = name.strip().split()
         if len(name_parts) < 3:
             raise HTTPException(status_code=400, detail="Please enter your full name with at least 3 names (first, middle, last).")
 
-        # Validate admission number not empty
         admission_number = admission_number.strip()
         if not admission_number:
             raise HTTPException(status_code=400, detail="Admission number is required.")
 
-        # Check admission number not already registered for this course
         existing = supabase.table("students") \
-            .select("id") \
-            .eq("course_id", int(course_id)) \
-            .eq("admission_number", admission_number) \
-            .execute()
+            .select("id").eq("course_id", int(course_id)) \
+            .eq("admission_number", admission_number).execute()
         if existing.data:
             raise HTTPException(status_code=400, detail="This admission number is already registered for this course.")
 
-        # Extract face embeddings from all pose photos
         embeddings = []
         for photo in photos:
             file_bytes = await photo.read()
@@ -173,7 +171,7 @@ async def register_student(
                     raise HTTPException(status_code=400, detail="Image too bright. Avoid direct light behind you.")
             img   = load_cv2_image(file_bytes)
             faces = face_app.get(img)
-            if len(faces) == 0:
+            if not faces:
                 continue
             face = max(faces, key=lambda f: f.det_score)
             embeddings.append(face.embedding.tolist())
@@ -197,37 +195,31 @@ async def register_student(
     except HTTPException:
         raise
     except Exception as e:
-        # Catch unique constraint violation from DB as well
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             raise HTTPException(status_code=400, detail="This admission number is already registered for this course.")
         raise HTTPException(status_code=400, detail=str(e))
 
-
-# ── MARK ATTENDANCE (student self-verification) ───────────────────
+# ── MARK ATTENDANCE — full validation here ────────────────────────
 @app.post("/attend")
 async def mark_attendance(
     request:     Request,
     photos:      list[UploadFile] = File(...),
-    token:       str  = Form(...),
-    student_lat: str  = Form(""),
-    student_lng: str  = Form(""),
+    token:       str = Form(...),
+    student_lat: str = Form(""),
+    student_lng: str = Form(""),
 ):
     try:
         client_ip = get_client_ip(request)
-
-        # Parse optional GPS
         lat = float(student_lat) if student_lat else None
         lng = float(student_lng) if student_lng else None
 
-        # Validate token (checks expiry, IP, geolocation)
-        token_row = validate_token(token, client_ip, lat, lng)
+        # Full validation — expiry + IP + geo all checked here
+        token_row = validate_token_full(token, client_ip, lat, lng)
         course_id = token_row["course_id"]
 
-        # Load all registered students for this course
         result = supabase.table("students") \
             .select("id, name, admission_number, face_embedding") \
-            .eq("course_id", course_id) \
-            .execute()
+            .eq("course_id", course_id).execute()
 
         students = result.data
         if not students:
@@ -243,7 +235,6 @@ async def mark_attendance(
                     "embedding":        json.loads(s["face_embedding"])
                 })
 
-        # Extract embeddings from the student's live pose photos
         detected_embeddings = []
         for photo in photos:
             file_bytes = await photo.read()
@@ -253,12 +244,10 @@ async def mark_attendance(
                 detected_embeddings.append(face.embedding.tolist())
 
         if not detected_embeddings:
-            raise HTTPException(status_code=400, detail="No face detected in your photos. Please try again in better lighting.")
+            raise HTTPException(status_code=400, detail="No face detected. Please try again in better lighting.")
 
-        # Average all pose embeddings for a stronger match
         avg_detected = np.mean(detected_embeddings, axis=0).tolist()
 
-        # Find best matching student
         best_match      = None
         best_similarity = -1.0
         for student in stored:
@@ -268,31 +257,23 @@ async def mark_attendance(
                 best_match      = student
 
         if not best_match or best_similarity < THRESHOLD:
-            raise HTTPException(
-                status_code=400,
-                detail="Face not recognised. Make sure you are registered for this course and try again in good lighting."
-            )
+            raise HTTPException(status_code=400, detail="Face not recognised. Make sure you are registered for this course and try again in good lighting.")
 
-        # Check if already marked today
         today = datetime.now(timezone.utc).date().isoformat()
         already = supabase.table("attendance") \
-            .select("id, status") \
-            .eq("course_id", course_id) \
-            .eq("student_id", best_match["id"]) \
-            .eq("date", today) \
-            .execute()
+            .select("id").eq("course_id", course_id) \
+            .eq("student_id", best_match["id"]).eq("date", today).execute()
 
         if already.data:
             return {
-                "success":    True,
+                "success":        True,
                 "already_marked": True,
-                "name":       best_match["name"],
-                "admission":  best_match["admission_number"],
-                "confidence": round(best_similarity, 3),
-                "message":    f"Attendance already marked for {best_match['name']} today."
+                "name":           best_match["name"],
+                "admission":      best_match["admission_number"],
+                "confidence":     round(best_similarity, 3),
+                "message":        f"Attendance already marked for {best_match['name']} today."
             }
 
-        # Save attendance record
         supabase.table("attendance").insert({
             "course_id":   course_id,
             "student_id":  best_match["id"],
@@ -306,12 +287,12 @@ async def mark_attendance(
         }).execute()
 
         return {
-            "success":    True,
+            "success":        True,
             "already_marked": False,
-            "name":       best_match["name"],
-            "admission":  best_match["admission_number"],
-            "confidence": round(best_similarity, 3),
-            "message":    f"Attendance marked successfully for {best_match['name']}!"
+            "name":           best_match["name"],
+            "admission":      best_match["admission_number"],
+            "confidence":     round(best_similarity, 3),
+            "message":        f"Attendance marked successfully for {best_match['name']}!"
         }
 
     except HTTPException:
@@ -319,25 +300,7 @@ async def mark_attendance(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── VALIDATE TOKEN (frontend pre-check before showing camera) ─────
-@app.get("/token/{token_str}")
-async def check_token(token_str: str, request: Request, lat: str = "", lng: str = ""):
-    client_ip = get_client_ip(request)
-    lat_f = float(lat) if lat else None
-    lng_f = float(lng) if lng else None
-    token_row = validate_token(token_str, client_ip, lat_f, lng_f)
-    # Return course info so student page can show course name
-    course = supabase.table("courses").select("title, code").eq("id", token_row["course_id"]).single().execute()
-    return {
-        "valid":      True,
-        "course_id":  token_row["course_id"],
-        "course":     course.data,
-        "expires_at": token_row["expires_at"]
-    }
-
-
-# ── ORIGINAL MATCH (teacher bulk match — kept for backwards compat) ─
+# ── ORIGINAL MATCH (teacher bulk — backwards compat) ─────────────
 @app.post("/match")
 async def match_attendance(
     photos:    list[UploadFile] = File(...),
@@ -347,8 +310,7 @@ async def match_attendance(
     try:
         result = supabase.table("students") \
             .select("id, name, admission_number, face_embedding") \
-            .eq("course_id", int(course_id)) \
-            .execute()
+            .eq("course_id", int(course_id)).execute()
 
         students = result.data
         if not students:
@@ -358,10 +320,9 @@ async def match_attendance(
         for s in students:
             if s["face_embedding"]:
                 stored.append({
-                    "id":               s["id"],
-                    "name":             s["name"],
+                    "id": s["id"], "name": s["name"],
                     "admission_number": s["admission_number"],
-                    "embedding":        json.loads(s["face_embedding"])
+                    "embedding": json.loads(s["face_embedding"])
                 })
 
         detected_embeddings = []
@@ -377,7 +338,6 @@ async def match_attendance(
 
         present_ids = set()
         matches     = []
-
         for detected_emb in detected_embeddings:
             best_match      = None
             best_similarity = -1.0
@@ -386,16 +346,15 @@ async def match_attendance(
                 if sim > best_similarity:
                     best_similarity = sim
                     best_match      = student
-
             if best_match and best_similarity >= THRESHOLD:
                 if best_match["id"] not in present_ids:
                     present_ids.add(best_match["id"])
                     matches.append({
-                        "student_db_id":  best_match["id"],
-                        "name":           best_match["name"],
+                        "student_db_id":    best_match["id"],
+                        "name":             best_match["name"],
                         "admission_number": best_match["admission_number"],
-                        "confidence":     round(best_similarity, 3),
-                        "distance":       round(1 - best_similarity, 3)
+                        "confidence":       round(best_similarity, 3),
+                        "distance":         round(1 - best_similarity, 3)
                     })
 
         attendance_date = date or None
@@ -408,7 +367,6 @@ async def match_attendance(
                 "status":     "present",
                 "confidence": match["confidence"]
             })
-
         absent_ids = [s["id"] for s in stored if s["id"] not in present_ids]
         for sid in absent_ids:
             records.append({
@@ -418,19 +376,15 @@ async def match_attendance(
                 "status":     "absent",
                 "confidence": None
             })
-
         if records:
-            supabase.table("attendance").upsert(
-                records,
-                on_conflict="course_id,student_id,date"
-            ).execute()
+            supabase.table("attendance").upsert(records, on_conflict="course_id,student_id,date").execute()
 
         return {
-            "success":        True,
+            "success": True,
             "total_students": len(stored),
-            "present":        len(matches),
-            "absent":         len(absent_ids),
-            "matches":        matches
+            "present": len(matches),
+            "absent":  len(absent_ids),
+            "matches": matches
         }
 
     except HTTPException:
@@ -438,16 +392,13 @@ async def match_attendance(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ── GET STUDENTS ──────────────────────────────────────────────────
 @app.get("/students/{course_id}")
 def get_students(course_id: int):
     result = supabase.table("students") \
         .select("id, name, admission_number, email, registered_at, consent") \
-        .eq("course_id", course_id) \
-        .execute()
+        .eq("course_id", course_id).execute()
     return {"students": result.data}
-
 
 # ── GET ATTENDANCE ────────────────────────────────────────────────
 @app.get("/attendance/{course_id}")
