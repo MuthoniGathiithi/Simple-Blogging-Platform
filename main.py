@@ -1,4 +1,4 @@
-import os, json, math
+import os, json, math, uuid
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,8 @@ from PIL import Image, ImageStat
 from insightface.app import FaceAnalysis
 import cv2, io
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from dateutil.parser import isoparse
 
 face_app = None
 
@@ -78,21 +79,18 @@ def get_client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
     return request.client.host
 
-# ── SAFE TIME PARSER (FIXED) ────────────────────────────────────
+# ── ROBUST TIME PARSER ───────────────────────────────────────────
+# python-dateutil handles ALL Supabase timestamp formats reliably:
+# "2025-01-15T10:30:00Z", "2025-01-15T10:30:00+00:00",
+# "2025-01-15T10:30:00.123456+00:00", naive "2025-01-15T10:30:00"
 def parse_utc_time(value: str) -> datetime:
-    """
-    Safely parse Supabase timestamptz into UTC-aware datetime.
-    Handles both 'Z' suffix and offset formats, and naive datetimes.
-    """
-    if value.endswith("Z"):
-        value = value.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(value)
-
-    # Ensure timezone-aware
+    dt = isoparse(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-
     return dt
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 # ── TOKEN VALIDATION ────────────────────────────────────────────
 def validate_token_full(token_str: str, client_ip: str, student_lat, student_lng) -> dict:
@@ -105,15 +103,16 @@ def validate_token_full(token_str: str, client_ip: str, student_lat, student_lng
 
     token = res.data[0]
 
-    # FIXED EXPIRY CHECK
     expires_at = parse_utc_time(token["expires_at"])
-    if datetime.now(timezone.utc) > expires_at:
+    now        = now_utc()
+    print(f"[DEBUG] now={now.isoformat()} expires_at={expires_at.isoformat()} diff={(expires_at - now).total_seconds():.1f}s")
+
+    if now > expires_at:
         raise HTTPException(
             status_code=403,
             detail="This attendance link has expired. Ask your lecturer to generate a new one."
         )
 
-    # IP CHECK
     if token.get("allowed_ip"):
         if client_ip != token["allowed_ip"]:
             raise HTTPException(
@@ -121,7 +120,6 @@ def validate_token_full(token_str: str, client_ip: str, student_lat, student_lng
                 detail=f"You must be on the school WiFi to mark attendance. (Your IP: {client_ip})"
             )
 
-    # GEO CHECK
     if token.get("school_lat") and token.get("school_lng"):
         if student_lat is None or student_lng is None:
             raise HTTPException(
@@ -151,9 +149,52 @@ def root():
 def ping():
     return {"ok": True}
 
-# ── VALIDATE TOKEN (GET — expiry check ONLY, no IP/geo) ──────────
-# Called when student first opens the link to show course name.
-# IP and geo are only enforced at POST /attend when they actually submit.
+# ── GENERATE TOKEN ────────────────────────────────────────────────
+# Called by teacher dashboard. Server computes expires_at in UTC
+# so the client clock / timezone is completely irrelevant.
+@app.post("/generate-token")
+async def generate_token(
+    course_id:    str = Form(...),
+    teacher_id:   str = Form(...),
+    duration_min: int = Form(90),
+    allowed_ip:   str = Form(""),
+    school_lat:   str = Form(""),
+    school_lng:   str = Form(""),
+    geo_radius_m: int = Form(500),
+):
+    try:
+        token_str  = str(uuid.uuid4())
+        expires_at = now_utc() + timedelta(minutes=duration_min)
+
+        insert_data = {
+            "token":        token_str,
+            "course_id":    int(course_id),
+            "teacher_id":   teacher_id,
+            "expires_at":   expires_at.isoformat(),
+            "is_active":    True,
+            "geo_radius_m": geo_radius_m,
+        }
+
+        if allowed_ip.strip():
+            insert_data["allowed_ip"] = allowed_ip.strip()
+
+        if school_lat.strip() and school_lng.strip():
+            insert_data["school_lat"] = float(school_lat)
+            insert_data["school_lng"] = float(school_lng)
+
+        supabase.table("attendance_tokens").insert(insert_data).execute()
+
+        return {
+            "success":    True,
+            "token":      token_str,
+            "expires_at": expires_at.isoformat(),
+            "expires_in": f"{duration_min} minutes",
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── VALIDATE TOKEN (GET — expiry check only, no IP/geo) ──────────
 @app.get("/token/{token_str}")
 async def check_token(token_str: str):
     res = supabase.table("attendance_tokens") \
@@ -164,9 +205,11 @@ async def check_token(token_str: str):
 
     token = res.data[0]
 
-    # FIXED EXPIRY CHECK — uses parse_utc_time
     expires_at = parse_utc_time(token["expires_at"])
-    if datetime.now(timezone.utc) > expires_at:
+    now        = now_utc()
+    print(f"[DEBUG /token] now={now.isoformat()} expires_at={expires_at.isoformat()} diff={(expires_at - now).total_seconds():.1f}s")
+
+    if now > expires_at:
         raise HTTPException(
             status_code=403,
             detail="This attendance link has expired. Ask your lecturer to generate a new one."
@@ -179,7 +222,8 @@ async def check_token(token_str: str):
         "valid":      True,
         "course_id":  token["course_id"],
         "course":     course.data,
-        "expires_at": token["expires_at"]
+        "expires_at": token["expires_at"],
+        "server_now": now.isoformat()
     }
 
 # ── REGISTER ─────────────────────────────────────────────────────
@@ -258,7 +302,7 @@ async def register_student(
             )
         raise HTTPException(status_code=400, detail=str(e))
 
-# ── MARK ATTENDANCE — full validation here ────────────────────────
+# ── MARK ATTENDANCE ───────────────────────────────────────────────
 @app.post("/attend")
 async def mark_attendance(
     request:     Request,
@@ -272,7 +316,6 @@ async def mark_attendance(
         lat = float(student_lat) if student_lat else None
         lng = float(student_lng) if student_lng else None
 
-        # Full validation — expiry + IP + geo all checked here
         token_row = validate_token_full(token, client_ip, lat, lng)
         course_id = token_row["course_id"]
 
@@ -324,7 +367,7 @@ async def mark_attendance(
                 detail="Face not recognised. Make sure you are registered for this course and try again in good lighting."
             )
 
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = now_utc().date().isoformat()
         already = supabase.table("attendance") \
             .select("id").eq("course_id", course_id) \
             .eq("student_id", best_match["id"]).eq("date", today).execute()
@@ -348,7 +391,7 @@ async def mark_attendance(
             "confidence":  round(best_similarity, 3),
             "student_lat": lat,
             "student_lng": lng,
-            "marked_at":   datetime.now(timezone.utc).isoformat()
+            "marked_at":   now_utc().isoformat()
         }).execute()
 
         return {
@@ -365,7 +408,7 @@ async def mark_attendance(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── ORIGINAL MATCH (teacher bulk — backwards compat) ─────────────
+# ── MATCH (teacher bulk upload) ───────────────────────────────────
 @app.post("/match")
 async def match_attendance(
     photos:    list[UploadFile] = File(...),
@@ -446,11 +489,11 @@ async def match_attendance(
             supabase.table("attendance").upsert(records, on_conflict="course_id,student_id,date").execute()
 
         return {
-            "success":       True,
+            "success":        True,
             "total_students": len(stored),
-            "present":       len(matches),
-            "absent":        len(absent_ids),
-            "matches":       matches
+            "present":        len(matches),
+            "absent":         len(absent_ids),
+            "matches":        matches
         }
 
     except HTTPException:
